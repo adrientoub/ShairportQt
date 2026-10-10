@@ -238,6 +238,8 @@ void RaopServer::OnSessionStarted(const shared_ptr<AirPlay2::Ap2AudioSession>& s
 		previous->Flush();
 		StopSession(previous);
 	}
+	spdlog::info("Volume: AirPlay 2 session started for {}, saved volume is {} dB", session->GetClientID(),
+		VariantValue::Key("Volume").TryGet<int64_t>(m_config).value_or(0) / 1000.);
 }
 
 void RaopServer::OnSessionEnded(const shared_ptr<AirPlay2::Ap2AudioSession>& session)
@@ -662,6 +664,10 @@ void RaopServer::Run() noexcept
 								}
 							}
 							response.set_content("volume: "s + strVolume + "\r\n"s, "text/parameters"s);
+
+							spdlog::info("Volume: {} sender {} asked for the volume (GET_PARAMETER), replied {} dB",
+								connectionState && connectionState->airPlay2 && connectionState->airPlay2->IsAirPlay2() ? "AirPlay 2" : "AirPlay 1",
+								request.remote_addr, strVolume);
 						}
 					}
 					else if (request.method == "SET_PARAMETER"s)
@@ -739,6 +745,12 @@ void RaopServer::Run() noexcept
 											const Variant varVolume = i->second;
 											const double volVal = VariantValue::Get<double>(varVolume);
 											const int64_t volume = std::llround(volVal * 1000.);
+											const int64_t previous = VariantValue::Key("Volume").TryGet<int64_t>(m_config).value_or(0);
+
+											spdlog::info("Volume: {} sender {} set the volume (SET_PARAMETER) to \"{}\" = {} dB (linear {:.3f}), saved volume was {} dB",
+												connectionState && connectionState->airPlay2 && connectionState->airPlay2->IsAirPlay2() ? "AirPlay 2" : "AirPlay 1",
+												request.remote_addr, i->second, volume / 1000., volume <= -144000 ? 0. : pow(10.0, volume * 0.00005),
+												previous / 1000.);
 
 											VariantValue::Key("Volume").Set(m_config, volume);
 										}
@@ -1054,6 +1066,9 @@ void RaopServer::Run() noexcept
 					else if (request.method == "RECORD"s)
 					{
 						response.set_header("Audio-Latency"s, "6174"s);
+
+						spdlog::info("Volume: AirPlay 1 sender {} starts playing (RECORD), saved volume is {} dB",
+							request.remote_addr, VariantValue::Key("Volume").TryGet<int64_t>(m_config).value_or(0) / 1000.);
 					}
 				}
 				catch (const exception& e)

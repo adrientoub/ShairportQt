@@ -286,6 +286,9 @@ static SharedPtr<IValueCollection> LoadConfig()
 
 static void SaveConfig(const SharedPtr<IValueCollection>& config)
 {
+    spdlog::info("Volume: saving volume {} dB to the config",
+        VariantValue::Key("Volume").TryGet<double>(config).value_or(0.) / 1000.);
+
     auto configStream = MakeShared<BlobStream>();
 
     if (!ToJson(config, configStream, JsonFormat::humanreadable))
@@ -445,6 +448,11 @@ static void InitializeConfig(const SharedPtr<IValueCollection>& config)
         )
     {
         // 0 db
+        spdlog::info("Volume: no valid saved volume in the config, using 0 dB");
         VariantValue::Key("Volume").Set(config, 0);
+    }
+    else
+    {
+        spdlog::info("Volume: loaded saved volume {} dB from the config", VariantValue::Key("Volume").Get<double>(config) / 1000.);
     }
 }

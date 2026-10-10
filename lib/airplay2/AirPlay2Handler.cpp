@@ -480,7 +480,12 @@ namespace AirPlay2
         {
             fex[i] = static_cast<uint8_t>(features >> (8 * i));
         }
-        const double volume = VariantValue::Key("Volume").TryGet<double>(m_config).value_or(-15000.) / 1000.;
+        const auto savedVolume = VariantValue::Key("Volume").TryGet<double>(m_config);
+        const double volume = savedVolume.value_or(-15000.) / 1000.;
+
+        spdlog::info("Volume: AirPlay 2 /info for {}: saved volume {}, advertising initialVolume {} dB",
+            request.remoteAddr, savedVolume.has_value() ? to_string(savedVolume.value() / 1000.) + " dB"s : "unreadable (using default)"s,
+            max(-30., min(0., volume)));
 
         auto info = Plist::Dict();
 
