@@ -2251,6 +2251,9 @@ void MainDlg::SetVolume(double v) noexcept
 {
     try
     {
+        spdlog::info("Volume: local change requested to linear {:.3f} (current {:.3f}), sending DACP volumeup/volumedown to the sender",
+            v, GetVolume());
+
         m_threadSetVolume.emplace_back([this, targetVolume = v]() 
         {
             const ScopeContext determineCurrentVolume([this]() {
