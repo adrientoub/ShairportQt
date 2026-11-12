@@ -2,6 +2,7 @@
 
 #include "LayerCake.h"
 #include "airplay2/Ap2Crypto.h"
+#include "airplay2/SecureChannel.h"
 #include <atomic>
 #include <map>
 #include <memory>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "sockpp/tcp_acceptor.h"
+#include "sockpp/tcp_socket.h"
 
 namespace AirPlay2
 {
@@ -53,6 +55,41 @@ namespace AirPlay2
         virtual void OnSessionEnded(const std::shared_ptr<Ap2AudioSession>& session) = 0;
         // DACP remote control information
         virtual void OnDacp(const std::string& dacpID, const std::string& activeRemote, const std::string& remoteAddr) = 0;
+        // the sender's event channel (AirPlay 2 remote control) became available / unavailable
+        virtual void OnRemoteControl(const std::string& /*remoteAddr*/, bool /*available*/) {}
+    };
+
+    // the reverse connection the sender opens to our event port: AirPlay 2 senders don't announce
+    // a DACP service, remote control commands are sent as "POST /command" over this channel
+    class EventChannel
+    {
+    public:
+        EventChannel(sockpp::tcp_socket socket, const Bytes& secret, std::string remoteAddr);
+
+        EventChannel(const EventChannel&) = delete;
+        EventChannel& operator=(const EventChannel&) = delete;
+
+        // sends "POST /command" with a binary plist body and waits for the response;
+        // returns the RTSP status code of the response or -1 on errors
+        int PostCommand(const Plist& command, int timeoutMs = 2000);
+
+        // reads (and logs) data sent by the client without being requested,
+        // returns false once the connection has been closed
+        bool Poll();
+
+        void Close() noexcept;
+
+        const std::string& RemoteAddr() const noexcept { return m_remoteAddr; }
+
+        // builds the (plain) "POST /command" request
+        static std::string BuildCommandRequest(const Plist& command);
+
+    private:
+        std::mutex                          m_mtx;
+        sockpp::tcp_socket                  m_socket;
+        SecureChannel                       m_cipher;
+        const std::string                   m_remoteAddr;
+        bool                                m_open{ true };
     };
 
     using TxtRecords = std::vector<std::pair<std::string, std::string>>;
@@ -124,7 +161,25 @@ namespace AirPlay2
 
         const std::string& DeviceId() const noexcept { return m_deviceId; }
 
+        // sends a DACP style remote control command ("playpause", "nextitem", ...) to the
+        // sender of the active AirPlay 2 session; returns false if that's not possible
+        bool SendRemoteCommand(const std::string& dacpCommand);
+
+        // true if an AirPlay 2 sender can be remote controlled
+        bool HasRemoteControl() const;
+
+        // MediaRemote command id of a DACP command, -1 if there's none
+        static int MediaRemoteCommand(const std::string& dacpCommand) noexcept;
+
         static constexpr const char* SourceVersion = "366.0";
+
+        // the most recent event channel (shared with the event channel threads)
+        struct RemoteState
+        {
+            std::mutex                      mtx;
+            std::weak_ptr<EventChannel>     channel;
+            IHost*                          host{ nullptr };
+        };
 
     private:
         void HandleInfo(const Request& request, Response& response) const;
@@ -133,7 +188,7 @@ namespace AirPlay2
         void HandleTeardown(Connection& connection, const Request& request, Response& response);
         void HandleSetRateAnchorTime(Connection& connection, const Request& request, Response& response);
         void HandleFlushBuffered(Connection& connection, const Request& request, Response& response);
-        void StartEventChannel(Connection& connection);
+        void StartEventChannel(Connection& connection, const std::string& remoteAddr);
         std::shared_ptr<PtpClock> GetClock();
         void EndSession(Connection& connection);
 
@@ -149,5 +204,7 @@ namespace AirPlay2
 
         std::mutex                          m_mtxClock;
         std::shared_ptr<PtpClock>           m_clock;
+
+        const std::shared_ptr<RemoteState>  m_remote;
     };
 }

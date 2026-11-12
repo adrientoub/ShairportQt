@@ -961,6 +961,35 @@ void MainDlg::SendDacpCommand(const string& cmd)
 {
     unique_lock<mutex> sync(m_mtx);
 
+    if (m_currentDacpID.airPlay2 && m_currentDacpID.id)
+    {
+        // AirPlay 2 senders are remote controlled through the session's event channel
+        auto raopServer = m_raopServer;
+        sync.unlock();
+
+        if (!raopServer)
+        {
+            return;
+        }
+        try
+        {
+            auto asyncSendCommand = async(launch::async, [raopServer = std::move(raopServer), cmd]() -> void
+                {
+                    const bool ok = raopServer->SendAirPlay2Command(cmd);
+                    spdlog::debug("SendAirPlay2Command({}) result: {}", cmd, ok);
+                });
+            if (asyncSendCommand.wait_for(300ms) == future_status::timeout)
+            {
+                sync.lock();
+                m_listAsyncOperations.emplace_back(std::move(asyncSendCommand));
+            }
+        }
+        catch (const exception& e)
+        {
+            spdlog::error("Main Dialog: failed to SendAirPlay2Command({}): {}", cmd, e.what());
+        }
+        return;
+    }
     auto entry = m_mapDacpService.find(m_currentDacpID.id);
 
     if (entry != m_mapDacpService.end())
@@ -1168,7 +1197,7 @@ void MainDlg::OnSetCurrentDacpID(DacpID&& dacpID) noexcept
         const lock_guard<mutex> guard(m_mtx);
         m_currentDacpID = std::move(dacpID);
 
-        if (m_currentDacpID.id == 0 || m_mapDacpService.find(m_currentDacpID.id) != m_mapDacpService.end())
+        if (m_currentDacpID.id == 0 || m_currentDacpID.airPlay2 || m_mapDacpService.find(m_currentDacpID.id) != m_mapDacpService.end())
         {
             bPostNewState = true;
         }
@@ -1370,12 +1399,18 @@ void MainDlg::OnShowMessage(int text)
 }
 
 // Widget slot: UpdateMMState
+bool MainDlg::IsRemoteControlAvailable() const
+{
+    // m_mtx must be held
+    return m_currentDacpID.id != 0 &&
+        (m_currentDacpID.airPlay2 || m_mapDacpService.find(m_currentDacpID.id) != m_mapDacpService.end());
+}
+
 void MainDlg::OnUpdateMMState()
 {
     unique_lock<mutex> sync(m_mtx);
 
-    auto entry = m_mapDacpService.find(m_currentDacpID.id);
-    const bool enabled = entry != m_mapDacpService.end();
+    const bool enabled = IsRemoteControlAvailable();
     
     sync.unlock();
     
@@ -1397,8 +1432,7 @@ void MainDlg::OnPlayState(bool isPlaying)
     const bool wasPlaying = m_isPlaying;
     m_isPlaying = isPlaying;
 
-    auto entry = m_mapDacpService.find(m_currentDacpID.id);
-    const bool enabled = entry != m_mapDacpService.end();
+    const bool enabled = IsRemoteControlAvailable();
 
     sync.unlock();
 

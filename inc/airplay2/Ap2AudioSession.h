@@ -39,6 +39,42 @@ namespace AirPlay2
     // [4 seq/flags][4 timestamp][4 ssrc][ciphertext][16 tag][8 nonce] (AAD = timestamp + ssrc)
     bool DecryptAudioPacket(const uint8_t* packet, size_t len, const Bytes& key, AudioFrame& frame);
 
+    // difference a - b of two 23 bit sequence numbers of buffered audio (in the range [-2^22, 2^22))
+    int32_t SeqDiff(uint32_t a, uint32_t b) noexcept;
+
+    // FLUSHBUFFERED requests are based on sequence numbers: RTP timestamps may jump arbitrarily
+    // (e.g. when skipping to the next track) but the sequence numbers of the stream are continuous
+    class FlushTracker
+    {
+    public:
+        // immediate flush: everything before untilSeq is dropped
+        void Immediate(uint32_t untilSeq);
+        // deferred flush: [fromSeq, untilSeq) is dropped
+        void Deferred(uint32_t fromSeq, uint32_t untilSeq);
+        bool IsFlushed(uint32_t seq) const noexcept;
+        // the stream reached seq (in receive order): finished flushes are removed
+        void OnFrame(uint32_t seq) noexcept;
+        bool Empty() const noexcept { return !m_immediateUntil.has_value() && m_deferred.empty(); }
+        void Clear() noexcept;
+
+    private:
+        struct Range
+        {
+            uint32_t from;
+            uint32_t until;
+        };
+        std::optional<uint32_t> m_immediateUntil;
+        std::deque<Range>       m_deferred;
+    };
+
+    struct FlushRequest
+    {
+        std::optional<uint32_t> fromSeq;
+        std::optional<uint32_t> fromTimestamp;
+        std::optional<uint32_t> untilSeq;
+        uint32_t                untilTimestamp{ 0 };
+    };
+
     struct Ap2SessionParams
     {
         StreamType  type{ StreamType::Buffered };
@@ -66,7 +102,10 @@ namespace AirPlay2
         void SetRateAnchor(double rate, std::optional<uint32_t> rtpTime, std::optional<int64_t> networkTimeNs, uint64_t clockId);
 
         // FLUSHBUFFERED
-        void FlushBuffered(std::optional<uint32_t> fromTimestamp, uint32_t untilTimestamp);
+        void FlushBuffered(const FlushRequest& request);
+
+        // number of queued (not yet played) frames - for testing
+        size_t GetQueuedFrames() const;
 
         // stops the session (TEARDOWN of the stream)
         void Stop() noexcept;
@@ -94,7 +133,7 @@ namespace AirPlay2
 
         void EnqueueFrame(AudioFrame&& frame);
         bool ShouldPlay() const noexcept;
-        bool IsFlushed(uint32_t ts) const noexcept;
+        bool IsFlushed(const AudioFrame& frame) const noexcept;
 
         // player thread helpers (called without holding m_mtx)
         bool StartOutput();
@@ -128,8 +167,8 @@ namespace AirPlay2
         uint32_t                            m_anchorRtp{ 0 };
         std::optional<int64_t>              m_anchorLocalNs;
         bool                                m_restartPending{ false };
-        std::optional<uint32_t>             m_flushFrom;
-        std::optional<uint32_t>             m_flushUntil;
+        FlushTracker                        m_flush;
+        std::optional<uint32_t>             m_lastReceivedSeq;
 
         // output (player thread only)
         SharedPtr<BlobStream>               m_pcm;

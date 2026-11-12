@@ -9,7 +9,10 @@
 #include "sockpp/inet_address.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 using namespace std;
 using namespace string_literals;
@@ -158,6 +161,145 @@ namespace AirPlay2
         return i == headers.end() ? string{} : i->second;
     }
 
+    EventChannel::EventChannel(sockpp::tcp_socket socket, const Bytes& secret, string remoteAddr)
+        : m_socket(move(socket))
+        // as an accessory we write with the "Events-Write" key and read with the "Events-Read" key
+        // (unlike the control channel), so we use the controller's point of view
+        , m_cipher(SecureChannel::ForEvents(secret, false))
+        , m_remoteAddr(move(remoteAddr))
+    {
+    }
+
+    string EventChannel::BuildCommandRequest(const Plist& command)
+    {
+        const auto body = command.ToBinary();
+
+        string request = "POST /command RTSP/1.0\r\nContent-Length: "s + to_string(body.size()) +
+            "\r\nContent-Type: application/x-apple-binary-plist\r\n\r\n"s;
+        request.append(reinterpret_cast<const char*>(body.data()), body.size());
+        return request;
+    }
+
+    int EventChannel::PostCommand(const Plist& command, int timeoutMs)
+    {
+        const lock_guard<mutex> guard(m_mtx);
+
+        if (!m_open)
+        {
+            return -1;
+        }
+        const string request = BuildCommandRequest(command);
+        string encrypted;
+        m_cipher.Encrypt(reinterpret_cast<const uint8_t*>(request.data()), request.size(), encrypted);
+
+        if (m_socket.write_n(encrypted.data(), encrypted.size()) != static_cast<ssize_t>(encrypted.size()))
+        {
+            spdlog::warn("AirPlay2: failed to write to the event channel");
+            m_open = false;
+            return -1;
+        }
+        // wait for the response
+        const auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeoutMs);
+        string response;
+        uint8_t buffer[4096];
+
+        for (;;)
+        {
+            const auto headerEnd = response.find("\r\n\r\n");
+
+            if (headerEnd != string::npos)
+            {
+                string header = response.substr(0, headerEnd);
+                transform(header.begin(), header.end(), header.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
+
+                size_t contentLength = 0;
+                const auto cl = header.find("content-length:");
+
+                if (cl != string::npos)
+                {
+                    contentLength = strtoul(header.c_str() + cl + 15, nullptr, 10);
+                }
+                if (response.size() >= headerEnd + 4 + contentLength)
+                {
+                    break;
+                }
+            }
+            const auto remaining = chrono::duration_cast<chrono::milliseconds>(deadline - chrono::steady_clock::now()).count();
+
+            if (remaining <= 0)
+            {
+                spdlog::warn("AirPlay2: no response on the event channel");
+                return -1;
+            }
+            if (!WaitReadable(m_socket, static_cast<int>(min<long long>(remaining, 100))))
+            {
+                continue;
+            }
+            const auto n = m_socket.read(buffer, sizeof(buffer));
+
+            if (n <= 0 || !m_cipher.Decrypt(buffer, static_cast<size_t>(n), response))
+            {
+                spdlog::warn("AirPlay2: event channel closed while waiting for a response");
+                m_open = false;
+                return -1;
+            }
+        }
+        // "RTSP/1.0 200 OK"
+        if (response.size() < 12 || response.compare(0, 7, "RTSP/1.") != 0 || !isdigit(static_cast<unsigned char>(response[9])))
+        {
+            spdlog::warn("AirPlay2: invalid response on the event channel");
+            return -1;
+        }
+        return atoi(response.c_str() + 9);
+    }
+
+    bool EventChannel::Poll()
+    {
+        const lock_guard<mutex> guard(m_mtx);
+
+        if (!m_open)
+        {
+            return false;
+        }
+        if (!WaitReadable(m_socket, 0))
+        {
+            return true;
+        }
+        uint8_t buffer[4096];
+        const auto n = m_socket.read(buffer, sizeof(buffer));
+
+        if (n <= 0)
+        {
+            m_open = false;
+            return false;
+        }
+        string plain;
+
+        if (!m_cipher.Decrypt(buffer, static_cast<size_t>(n), plain))
+        {
+            spdlog::warn("AirPlay2: failed to decrypt the event channel");
+            m_open = false;
+            return false;
+        }
+        if (!plain.empty())
+        {
+            spdlog::debug("AirPlay2: unexpected data on the event channel: {}", plain.substr(0, plain.find('\r')));
+        }
+        return true;
+    }
+
+    void EventChannel::Close() noexcept
+    {
+        const lock_guard<mutex> guard(m_mtx);
+
+        if (m_open)
+        {
+            m_open = false;
+            m_socket.shutdown();
+        }
+        m_socket.close();
+    }
+
     Connection::Connection(const Crypto::Ed25519Key& identity, const string& deviceId)
         : m_pairing(make_unique<Pairing>(identity, deviceId))
     {
@@ -192,7 +334,10 @@ namespace AirPlay2
     Service::Service(SharedPtr<IValueCollection> config, IHost* host)
         : m_config(move(config))
         , m_host(host)
+        , m_remote(make_shared<RemoteState>())
     {
+        m_remote->host = host;
+
         // persistent identity
         const auto key = VariantValue::Key("AirPlay2Key").TryGet<vector<uint8_t>>(m_config);
 
@@ -233,6 +378,72 @@ namespace AirPlay2
 
     Service::~Service()
     {
+        const lock_guard<mutex> guard(m_remote->mtx);
+        m_remote->host = nullptr;
+    }
+
+    int Service::MediaRemoteCommand(const string& dacpCommand) noexcept
+    {
+        // MRMediaRemoteCommand
+        if (dacpCommand == "play")
+        {
+            return 0;
+        }
+        if (dacpCommand == "pause")
+        {
+            return 1;
+        }
+        if (dacpCommand == "playpause")
+        {
+            return 2;
+        }
+        if (dacpCommand == "stop")
+        {
+            return 3;
+        }
+        if (dacpCommand == "nextitem")
+        {
+            return 4;
+        }
+        if (dacpCommand == "previtem")
+        {
+            return 5;
+        }
+        return -1;
+    }
+
+    bool Service::HasRemoteControl() const
+    {
+        const lock_guard<mutex> guard(m_remote->mtx);
+        return !m_remote->channel.expired();
+    }
+
+    bool Service::SendRemoteCommand(const string& dacpCommand)
+    {
+        const int command = MediaRemoteCommand(dacpCommand);
+
+        if (command < 0)
+        {
+            return false;
+        }
+        shared_ptr<EventChannel> channel;
+        {
+            const lock_guard<mutex> guard(m_remote->mtx);
+            channel = m_remote->channel.lock();
+        }
+        if (!channel)
+        {
+            spdlog::info("AirPlay2: no event channel to send \"{}\"", dacpCommand);
+            return false;
+        }
+        auto plist = Plist::Dict();
+        plist.Set("type", Plist::String("sendMediaRemoteCommand"));
+        plist.Set("modernMediaRemoteCommand", Plist::UInteger(static_cast<uint64_t>(command)));
+
+        const int status = channel->PostCommand(plist);
+        spdlog::debug("AirPlay2: sent MediaRemote command {} (\"{}\") to {}: status {}", command, dacpCommand, channel->RemoteAddr(), status);
+
+        return status >= 200 && status < 300;
     }
 
     bool Service::IsSupported() noexcept
@@ -433,6 +644,15 @@ namespace AirPlay2
             else
             {
                 // /feedback, /command, /audioMode, /configure
+                if (path == "/command")
+                {
+                    Plist command;
+
+                    if (Plist::FromBinary(request.body, command) && command.IsDict())
+                    {
+                        spdlog::debug("AirPlay2: sender command \"{}\"", command.Get("type").AsString());
+                    }
+                }
                 response.status = 200;
             }
             return true;
@@ -541,7 +761,7 @@ namespace AirPlay2
         return m_clock;
     }
 
-    void Service::StartEventChannel(Connection& connection)
+    void Service::StartEventChannel(Connection& connection, const string& remoteAddr)
     {
         connection.StopEventChannel();
 
@@ -554,13 +774,34 @@ namespace AirPlay2
         connection.m_eventAcceptor = move(acceptor);
 
         Connection* conn = &connection;
+        const Bytes secret = connection.m_pairing->SharedSecret();
 
-        connection.m_eventThread = thread([conn]()
+        connection.m_eventThread = thread([conn, remote = m_remote, secret, remoteAddr]()
             {
-                // the event channel is used to send commands to the client (e.g. remote control);
-                // we accept the connection and discard anything the client sends
-                vector<sockpp::tcp_socket> sockets;
-                uint8_t buffer[1024];
+                // the event channel is used to send commands to the client (remote control)
+                shared_ptr<EventChannel> channel;
+
+                const auto release = [&channel, &remote]()
+                    {
+                        if (!channel)
+                        {
+                            return;
+                        }
+                        channel->Close();
+
+                        const lock_guard<mutex> guard(remote->mtx);
+
+                        if (remote->channel.lock() == channel)
+                        {
+                            remote->channel.reset();
+
+                            if (remote->host)
+                            {
+                                remote->host->OnRemoteControl(channel->RemoteAddr(), false);
+                            }
+                        }
+                        channel.reset();
+                    };
 
                 while (!conn->m_eventStop)
                 {
@@ -572,20 +813,30 @@ namespace AirPlay2
 
                             if (socket)
                             {
-                                spdlog::debug("AirPlay2: event channel connected");
-                                sockets.push_back(move(socket));
+                                release();
+
+                                if (secret.empty())
+                                {
+                                    spdlog::warn("AirPlay2: event channel connected without pairing, remote control is not available");
+                                    socket.close();
+                                    continue;
+                                }
+                                spdlog::debug("AirPlay2: event channel connected, remote control of {} is available", remoteAddr);
+                                channel = make_shared<EventChannel>(move(socket), secret, remoteAddr);
+
+                                const lock_guard<mutex> guard(remote->mtx);
+                                remote->channel = channel;
+
+                                if (remote->host)
+                                {
+                                    remote->host->OnRemoteControl(remoteAddr, true);
+                                }
                             }
                         }
-                        for (auto it = sockets.begin(); it != sockets.end();)
+                        if (channel && !channel->Poll())
                         {
-                            if (WaitReadable(*it, 0) && it->read(buffer, sizeof(buffer)) <= 0)
-                            {
-                                it = sockets.erase(it);
-                            }
-                            else
-                            {
-                                ++it;
-                            }
+                            spdlog::debug("AirPlay2: event channel closed");
+                            release();
                         }
                     }
                     catch (const exception& e)
@@ -594,11 +845,7 @@ namespace AirPlay2
                         break;
                     }
                 }
-                for (auto& socket : sockets)
-                {
-                    socket.shutdown();
-                    socket.close();
-                }
+                release();
             });
     }
 
@@ -634,7 +881,7 @@ namespace AirPlay2
         }
         try
         {
-            StartEventChannel(connection);
+            StartEventChannel(connection, request.remoteAddr);
         }
         catch (const exception& e)
         {
@@ -832,12 +1079,25 @@ namespace AirPlay2
         {
             return;
         }
-        optional<uint32_t> from;
+        FlushRequest flushRequest;
 
-        if (flush.Has("flushFromTS"))
+        const auto get = [&flush](const char* key) -> optional<uint32_t>
+            {
+                if (flush.Has(key))
+                {
+                    return static_cast<uint32_t>(flush.Get(key).AsUInt());
+                }
+                return nullopt;
+            };
+        flushRequest.fromSeq = get("flushFromSeq");
+        flushRequest.fromTimestamp = get("flushFromTS");
+        flushRequest.untilSeq = get("flushUntilSeq");
+        flushRequest.untilTimestamp = get("flushUntilTS").value_or(0);
+
+        if (!flushRequest.fromSeq.has_value() && flushRequest.fromTimestamp.has_value())
         {
-            from = static_cast<uint32_t>(flush.Get("flushFromTS").AsUInt());
+            spdlog::warn("AirPlay2: FLUSHBUFFERED with flushFromTS but without flushFromSeq");
         }
-        connection.m_session->FlushBuffered(from, static_cast<uint32_t>(flush.Get("flushUntilTS").AsUInt()));
+        connection.m_session->FlushBuffered(flushRequest);
     }
 }

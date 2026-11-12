@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <thread>
 #include <spdlog/spdlog.h>
+#include "sockpp/tcp_acceptor.h"
+#include "sockpp/tcp_connector.h"
 
 using namespace std;
 using namespace AirPlay2;
@@ -72,6 +74,236 @@ namespace
         }
         return client.SessionKey();
     }
+
+    // encrypted AirPlay 2 audio packet
+    Bytes MakeAudioPacket(const Bytes& key, uint32_t seq, uint32_t timestamp, uint32_t ssrc = 0x16000000)
+    {
+        const Bytes payload(32, 0);
+        Bytes packet(12 + payload.size() + 16 + 8);
+        const uint32_t values[3] = { 0x80000000 | seq, timestamp, ssrc };
+
+        for (int i = 0; i < 3; ++i)
+        {
+            for (int b = 0; b < 4; ++b)
+            {
+                packet[i * 4 + b] = static_cast<uint8_t>(values[i] >> (24 - 8 * b));
+            }
+        }
+        uint8_t nonce8[8] = { static_cast<uint8_t>(seq), static_cast<uint8_t>(seq >> 8), static_cast<uint8_t>(seq >> 16), 0, 0, 0, 0, 0 };
+        uint8_t nonce12[12]{};
+        memcpy(nonce12 + 4, nonce8, 8);
+
+        AirPlay2::Crypto::ChaChaEncrypt(key.data(), nonce12, packet.data() + 4, 8, payload.data(), payload.size(),
+            packet.data() + 12, packet.data() + 12 + payload.size());
+        memcpy(packet.data() + packet.size() - 8, nonce8, 8);
+        return packet;
+    }
+}
+
+TEST(AirPlay2, SeqDiff)
+{
+    EXPECT_EQ(SeqDiff(10, 5), 5);
+    EXPECT_EQ(SeqDiff(5, 10), -5);
+    EXPECT_EQ(SeqDiff(2, 0x7ffffe), 4);
+    EXPECT_EQ(SeqDiff(0x7ffffe, 2), -4);
+}
+
+TEST(AirPlay2, FlushTrackerImmediate)
+{
+    FlushTracker flush;
+    EXPECT_TRUE(flush.Empty());
+
+    flush.Immediate(100);
+    EXPECT_TRUE(flush.IsFlushed(50));
+    EXPECT_TRUE(flush.IsFlushed(99));
+    EXPECT_FALSE(flush.IsFlushed(100));
+    EXPECT_FALSE(flush.IsFlushed(101));
+
+    // still receiving old frames
+    flush.OnFrame(99);
+    EXPECT_FALSE(flush.Empty());
+
+    // the stream reached the end of the flush
+    flush.OnFrame(100);
+    EXPECT_TRUE(flush.Empty());
+    EXPECT_FALSE(flush.IsFlushed(50));
+
+    // wrap around
+    flush.Immediate(5);
+    EXPECT_TRUE(flush.IsFlushed(0x7ffff0));
+    EXPECT_FALSE(flush.IsFlushed(5));
+    flush.OnFrame(0x7fffff);
+    EXPECT_FALSE(flush.Empty());
+    flush.OnFrame(6);
+    EXPECT_TRUE(flush.Empty());
+}
+
+TEST(AirPlay2, FlushTrackerDeferred)
+{
+    FlushTracker flush;
+    flush.Deferred(200, 300);
+    EXPECT_FALSE(flush.IsFlushed(199));
+    EXPECT_TRUE(flush.IsFlushed(200));
+    EXPECT_TRUE(flush.IsFlushed(299));
+    EXPECT_FALSE(flush.IsFlushed(300));
+
+    flush.OnFrame(250);
+    EXPECT_FALSE(flush.Empty());
+    flush.OnFrame(300);
+    EXPECT_TRUE(flush.Empty());
+
+    // invalid range is ignored
+    flush.Deferred(300, 300);
+    EXPECT_TRUE(flush.Empty());
+
+    // an immediate flush cancels deferred flushes
+    flush.Deferred(400, 500);
+    flush.Immediate(350);
+    EXPECT_FALSE(flush.IsFlushed(450));
+    flush.Clear();
+    EXPECT_TRUE(flush.Empty());
+}
+
+TEST(AirPlay2, FlushBufferedWithTimestampJump)
+{
+    if (!Ap2Decoder::IsAvailable())
+    {
+        GTEST_SKIP() << "no AirPlay 2 decoder";
+    }
+    auto config = MakeShared<ValueCollection>();
+
+    Ap2SessionParams params;
+    params.type = StreamType::Buffered;
+    params.sharedKey = AirPlay2::Crypto::RandomBytes(32);
+    params.clientID = "127.0.0.1";
+    ASSERT_TRUE(AudioFormatFromAirPlayFormat(0x800000, params.format));
+
+    Ap2AudioSession session(config, params, nullptr);
+
+    // first track: rtp timestamps around 1616863876
+    uint32_t ts = 1616863876u;
+
+    for (uint32_t seq = 1000; seq < 1100; ++seq, ts += 1024)
+    {
+        const auto packet = MakeAudioPacket(params.sharedKey, seq, ts);
+        session.OnPacket(packet.data(), packet.size());
+    }
+    EXPECT_EQ(session.GetQueuedFrames(), 100u);
+
+    // the user skips to the next track: everything before 1100 is flushed
+    FlushRequest request;
+    request.untilSeq = 1100;
+    request.untilTimestamp = ts;
+    session.FlushBuffered(request);
+    EXPECT_EQ(session.GetQueuedFrames(), 0u);
+
+    // the next track has completely different timestamps (more than 2^31 apart)
+    ts = 4129416191u;
+
+    for (uint32_t seq = 1100; seq < 1150; ++seq, ts += 1024)
+    {
+        const auto packet = MakeAudioPacket(params.sharedKey, seq, ts);
+        session.OnPacket(packet.data(), packet.size());
+    }
+    // the new frames must not be dropped
+    EXPECT_EQ(session.GetQueuedFrames(), 50u);
+
+    // a later flush with a deferred range
+    request = {};
+    request.fromSeq = 1120;
+    request.untilSeq = 1130;
+    request.untilTimestamp = ts;
+    session.FlushBuffered(request);
+    EXPECT_EQ(session.GetQueuedFrames(), 40u);
+
+    session.Stop();
+}
+
+TEST(AirPlay2, MediaRemoteCommands)
+{
+    EXPECT_EQ(Service::MediaRemoteCommand("play"), 0);
+    EXPECT_EQ(Service::MediaRemoteCommand("pause"), 1);
+    EXPECT_EQ(Service::MediaRemoteCommand("playpause"), 2);
+    EXPECT_EQ(Service::MediaRemoteCommand("stop"), 3);
+    EXPECT_EQ(Service::MediaRemoteCommand("nextitem"), 4);
+    EXPECT_EQ(Service::MediaRemoteCommand("previtem"), 5);
+    EXPECT_EQ(Service::MediaRemoteCommand("volumeup"), -1);
+}
+
+TEST(AirPlay2, EventChannelCommand)
+{
+    const Bytes secret = AirPlay2::Crypto::RandomBytes(32);
+
+    sockpp::tcp_acceptor acceptor;
+    ASSERT_TRUE(acceptor.open(sockpp::inet_address("127.0.0.1", 0)));
+    const auto port = sockpp::inet_address(acceptor.address()).port();
+
+    // the sender (controller) connects to our event port
+    sockpp::tcp_connector sender;
+    ASSERT_TRUE(sender.connect(sockpp::inet_address("127.0.0.1", port)));
+    auto accepted = acceptor.accept();
+    ASSERT_TRUE(accepted.is_open());
+
+    EventChannel channel(move(accepted), secret, "127.0.0.1");
+
+    thread senderThread([&sender, &secret]()
+        {
+            auto cipher = SecureChannel::ForEvents(secret, true);
+            string request;
+            uint8_t buffer[4096];
+
+            for (;;)
+            {
+                const auto n = sender.read(buffer, sizeof(buffer));
+
+                if (n <= 0 || !cipher.Decrypt(buffer, static_cast<size_t>(n), request))
+                {
+                    return;
+                }
+                const auto headerEnd = request.find("\r\n\r\n");
+
+                if (headerEnd != string::npos)
+                {
+                    const auto cl = request.find("Content-Length: ");
+                    const size_t length = cl == string::npos ? 0 : strtoul(request.c_str() + cl + 16, nullptr, 10);
+
+                    if (request.size() >= headerEnd + 4 + length)
+                    {
+                        break;
+                    }
+                }
+            }
+            EXPECT_EQ(request.rfind("POST /command RTSP/1.0\r\n", 0), 0u);
+            EXPECT_NE(request.find("Content-Type: application/x-apple-binary-plist"), string::npos);
+
+            Plist command;
+            ASSERT_TRUE(Plist::FromBinary(request.substr(request.find("\r\n\r\n") + 4), command));
+            EXPECT_EQ(command.Get("type").AsString(), "sendMediaRemoteCommand");
+            EXPECT_EQ(command.Get("modernMediaRemoteCommand").AsUInt(), 4u);
+
+            const string response = "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+            string encrypted;
+            cipher.Encrypt(reinterpret_cast<const uint8_t*>(response.data()), response.size(), encrypted);
+            sender.write_n(encrypted.data(), encrypted.size());
+        });
+
+    auto command = Plist::Dict();
+    command.Set("type", Plist::String("sendMediaRemoteCommand"));
+    command.Set("modernMediaRemoteCommand", Plist::UInteger(4));
+    EXPECT_EQ(channel.PostCommand(command), 200);
+    senderThread.join();
+
+    EXPECT_TRUE(channel.Poll());
+
+    // the sender closes the connection
+    sender.close();
+
+    for (int i = 0; i < 50 && channel.Poll(); ++i)
+    {
+        this_thread::sleep_for(10ms);
+    }
+    EXPECT_FALSE(channel.Poll());
+    EXPECT_EQ(channel.PostCommand(command), -1);
 }
 
 TEST(AirPlay2, Tlv8Fragmentation)

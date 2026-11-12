@@ -14,6 +14,7 @@ typedef struct structDacpID
 	std::string		remoteIP;
 	std::string		activeRemote;
 	uint16_t		port{ 0 }; // network order
+	bool			airPlay2{ false }; // remote control via the AirPlay 2 event channel (no DACP service)
 } DacpID;
 
 typedef struct structDmapInfo
@@ -70,6 +71,9 @@ public:
 
 	static int SendDacpCommand(const DacpID& dacpID, const std::string& cmd) noexcept;
 
+	// remote control of an AirPlay 2 sender ("playpause", "nextitem", "volumeup", ...)
+	bool SendAirPlay2Command(const std::string& cmd) noexcept;
+
 	SharedPtr<IValueCollection> GetClient(const std::string& remoteAddr);
 
 	uint32_t GetErrorCode() const noexcept;
@@ -82,6 +86,7 @@ protected:
 	void OnSessionStarted(const std::shared_ptr<AirPlay2::Ap2AudioSession>& session) override;
 	void OnSessionEnded(const std::shared_ptr<AirPlay2::Ap2AudioSession>& session) override;
 	void OnDacp(const std::string& dacpID, const std::string& activeRemote, const std::string& remoteAddr) override;
+	void OnRemoteControl(const std::string& remoteAddr, bool available) override;
 
 private:
 	SharedPtr<IValueCollection> GetClient(const std::string& remoteAddr, bool create);
@@ -101,6 +106,7 @@ private:
 	mutable std::shared_mutex				m_mtxDecoder;
 	std::mutex								m_mtxRequest;	// serializes the RTSP request handling
 	const std::unique_ptr<AirPlay2::Service> m_airPlay2;
+	std::mutex								m_mtxDacp;		// guards m_lastDacp
 	std::string								m_lastDacp;
 	std::atomic_bool						m_serviceDisabled;
 	const SharedPtr<IValueCollection>  		m_clients;

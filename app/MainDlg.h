@@ -71,6 +71,7 @@ private:
     void ConfigureDacpBrowser();
     void ConfigureSystemTray();
     void SendDacpCommand(const std::string& cmd);
+    bool IsRemoteControlAvailable() const;
 
     void Minimize();
     

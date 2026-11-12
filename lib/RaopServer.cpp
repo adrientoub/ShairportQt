@@ -16,6 +16,7 @@
 #include "httplib/httplib_raop.h"
 
 #include <future>
+#include <functional>
 #include <condition_variable>
 #include <thread>
 #include <list>
@@ -262,11 +263,88 @@ void RaopServer::OnDacp(const string& dacpID, const string& activeRemote, const 
 {
 	const string key = dacpID + "|"s + activeRemote + "|"s + remoteAddr;
 
-	if (m_raopEvents && key != m_lastDacp)
+	if (m_raopEvents)
 	{
-		m_lastDacp = key;
+		{
+			const lock_guard<mutex> guard(m_mtxDacp);
+
+			if (key == m_lastDacp)
+			{
+				return;
+			}
+			m_lastDacp = key;
+		}
 		m_raopEvents->OnSetCurrentDacpID(DacpID{ HexToInteger(dacpID), m_hostName, remoteAddr, activeRemote, 0 });
 	}
+}
+
+void RaopServer::OnRemoteControl(const string& remoteAddr, bool available)
+{
+	if (!m_raopEvents)
+	{
+		return;
+	}
+	const string key = "ap2|"s + remoteAddr;
+	{
+		const lock_guard<mutex> guard(m_mtxDacp);
+
+		if (available)
+		{
+			m_lastDacp = key;
+		}
+		else if (m_lastDacp == key)
+		{
+			m_lastDacp.clear();
+		}
+		else
+		{
+			// another sender has taken over in the meantime
+			return;
+		}
+	}
+	if (available)
+	{
+		spdlog::info("AirPlay2: remote control of {} available", remoteAddr);
+		// there is no DACP ID with AirPlay 2: derive a non-zero ID from the address so the UI can identify the sender
+		const uint64_t id = static_cast<uint64_t>(hash<string>{}(key)) | 1;
+		m_raopEvents->OnSetCurrentDacpID(DacpID{ id, m_hostName, remoteAddr, ""s, 0, true });
+	}
+	else
+	{
+		spdlog::info("AirPlay2: remote control of {} no longer available", remoteAddr);
+		m_raopEvents->OnSetCurrentDacpID(DacpID{});
+	}
+}
+
+bool RaopServer::SendAirPlay2Command(const string& cmd) noexcept
+{
+	try
+	{
+		if (cmd == "volumeup" || cmd == "volumedown")
+		{
+			// MediaRemote has no volume command: adjust our own volume (16 steps over 30 dB like the sender's slider)
+			constexpr int64_t step = 1875;
+			int64_t volume = VariantValue::Key("Volume").TryGet<int64_t>(m_config).value_or(0);
+
+			if (cmd == "volumeup")
+			{
+				volume = volume < -30000 ? -30000 : min<int64_t>(volume + step, 0);
+			}
+			else
+			{
+				volume = volume - step < -30000 ? -144000 : volume - step;
+			}
+			VariantValue::Key("Volume").Set(m_config, volume);
+			spdlog::debug("AirPlay2: volume set to {} millidB", volume);
+			return true;
+		}
+		return m_airPlay2->SendRemoteCommand(cmd);
+	}
+	catch (const exception& e)
+	{
+		spdlog::error("AirPlay2: failed to send \"{}\": {}", cmd, e.what());
+	}
+	return false;
 }
 
 bool RaopServer::IsPlaying() const noexcept
@@ -947,7 +1025,10 @@ void RaopServer::Run() noexcept
 								{
 									const auto activeRemote = request.get_header_value("Active-Remote"s);
 									DacpID currentDacpID{ HexToInteger(dacpID), m_hostName, request.remote_addr, activeRemote, 0 };
-
+									{
+										const lock_guard<mutex> dacpGuard(m_mtxDacp);
+										m_lastDacp = dacpID + "|"s + activeRemote + "|"s + request.remote_addr;
+									}
 									m_raopEvents->OnSetCurrentDacpID(move(currentDacpID));
 								}
 								else

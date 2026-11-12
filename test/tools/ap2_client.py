@@ -197,23 +197,45 @@ def main():
     import math
     d = socket.create_connection((HOST, data_port))
     aead = ChaCha20Poly1305(shk)
-    ts = 0
-    for seq in range(250):
-        samples = []
-        for i in range(352):
-            v = int(8000 * math.sin(2 * math.pi * 440 * (ts + i) / 44100))
-            samples.append((v, v))
-        payload = alac_uncompressed_frame(samples)
-        header = struct.pack(">III", 0x80000000 | seq, ts, 0x0000FACE)
-        nonce8 = struct.pack("<Q", seq)
-        ct = aead.encrypt(b"\0" * 4 + nonce8, payload, header[4:12])
-        pkt = header + ct + nonce8
-        d.sendall(struct.pack(">H", len(pkt) + 2) + pkt)
-        ts += 352
+
+    def stream(first_seq, count, ts):
+        for seq in range(first_seq, first_seq + count):
+            samples = []
+            for i in range(352):
+                v = int(8000 * math.sin(2 * math.pi * 440 * (ts + i) / 44100))
+                samples.append((v, v))
+            payload = alac_uncompressed_frame(samples)
+            header = struct.pack(">III", 0x80000000 | seq, ts, 0x0000FACE)
+            nonce8 = struct.pack("<Q", seq)
+            ct = aead.encrypt(b"\0" * 4 + nonce8, payload, header[4:12])
+            pkt = header + ct + nonce8
+            d.sendall(struct.pack(">H", len(pkt) + 2) + pkt)
+            ts = (ts + 352) & 0xffffffff
+        return ts
+
+    ts = stream(0, 250, 0)
+    time.sleep(HOLD_SECONDS)
+
+    # skip to the next track: pause, flush everything sent so far and continue with a new timeline
+    # (the RTP timestamps jump by more than 2^31 like iOS does)
+    print("skipping to the next track")
+    anchor = plistlib.dumps({"rate": 0}, fmt=plistlib.FMT_BINARY)
+    code, _, _ = c.request("SETRATEANCHORTIME", "rtsp://127.0.0.1/1", anchor, "application/x-apple-binary-plist")
+    assert code == 200
+    code, _, _ = c.request("FLUSHBUFFERED", "rtsp://127.0.0.1/1",
+                           plistlib.dumps({"flushUntilSeq": 250, "flushUntilTS": ts}, fmt=plistlib.FMT_BINARY),
+                           "application/x-apple-binary-plist")
+    assert code == 200
+    ts = 0xC0000000
+    anchor = plistlib.dumps({"rate": 1, "rtpTime": ts, "networkTimeSecs": 0, "networkTimeFrac": 0, "networkTimeTimelineID": 0},
+                            fmt=plistlib.FMT_BINARY)
+    code, _, _ = c.request("SETRATEANCHORTIME", "rtsp://127.0.0.1/1", anchor, "application/x-apple-binary-plist")
+    assert code == 200
+    ts = stream(250, 250, ts)
     time.sleep(HOLD_SECONDS)
 
     code, _, _ = c.request("FLUSHBUFFERED", "rtsp://127.0.0.1/1",
-                           plistlib.dumps({"flushUntilSeq": 250, "flushUntilTS": ts}, fmt=plistlib.FMT_BINARY),
+                           plistlib.dumps({"flushUntilSeq": 500, "flushUntilTS": ts}, fmt=plistlib.FMT_BINARY),
                            "application/x-apple-binary-plist")
     code, _, _ = c.request("TEARDOWN", "rtsp://127.0.0.1/1",
                            plistlib.dumps({"streams": [{"type": 103}]}, fmt=plistlib.FMT_BINARY), "application/x-apple-binary-plist")

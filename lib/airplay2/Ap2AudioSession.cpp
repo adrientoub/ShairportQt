@@ -32,6 +32,12 @@ namespace AirPlay2
             return static_cast<int32_t>(a - b) < 0;
         }
 
+        // signed distance between two RTP timestamps
+        int64_t TsDiff(uint32_t a, uint32_t b) noexcept
+        {
+            return static_cast<int32_t>(a - b);
+        }
+
         bool WaitReadable(const sockpp::socket& socket, int ms) noexcept
         {
             const auto handle = socket.handle();
@@ -79,6 +85,74 @@ namespace AirPlay2
 
         return Crypto::ChaChaDecrypt(key.data(), nonce, packet + 4, 8,
             packet + 12, cipherLen, packet + 12 + cipherLen, frame.payload.data());
+    }
+
+    int32_t SeqDiff(uint32_t a, uint32_t b) noexcept
+    {
+        // sign extend the 23 bit difference
+        const uint32_t d = (a - b) & 0x7fffff;
+        return (d & 0x400000) ? static_cast<int32_t>(d) - 0x800000 : static_cast<int32_t>(d);
+    }
+
+    void FlushTracker::Immediate(uint32_t untilSeq)
+    {
+        m_immediateUntil = untilSeq & 0x7fffff;
+        // pending deferred flushes are obsolete (that's what shairport-sync does, too)
+        m_deferred.clear();
+    }
+
+    void FlushTracker::Deferred(uint32_t fromSeq, uint32_t untilSeq)
+    {
+        fromSeq &= 0x7fffff;
+        untilSeq &= 0x7fffff;
+
+        if (SeqDiff(untilSeq, fromSeq) > 0)
+        {
+            m_deferred.push_back({ fromSeq, untilSeq });
+        }
+    }
+
+    bool FlushTracker::IsFlushed(uint32_t seq) const noexcept
+    {
+        if (m_immediateUntil.has_value() && SeqDiff(seq, m_immediateUntil.value()) < 0)
+        {
+            return true;
+        }
+        for (const auto& range : m_deferred)
+        {
+            if (SeqDiff(seq, range.from) >= 0 && SeqDiff(seq, range.until) < 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void FlushTracker::OnFrame(uint32_t seq) noexcept
+    {
+        if (m_immediateUntil.has_value() && SeqDiff(seq, m_immediateUntil.value()) >= 0)
+        {
+            spdlog::debug("AirPlay2: immediate flush until seq {} completed at seq {}", m_immediateUntil.value(), seq);
+            m_immediateUntil.reset();
+        }
+        for (auto i = m_deferred.begin(); i != m_deferred.end();)
+        {
+            if (SeqDiff(seq, i->until) >= 0)
+            {
+                spdlog::debug("AirPlay2: deferred flush [{}, {}) completed at seq {}", i->from, i->until, seq);
+                i = m_deferred.erase(i);
+            }
+            else
+            {
+                ++i;
+            }
+        }
+    }
+
+    void FlushTracker::Clear() noexcept
+    {
+        m_immediateUntil.reset();
+        m_deferred.clear();
     }
 
     Ap2AudioSession::Ap2AudioSession(SharedPtr<IValueCollection> config, Ap2SessionParams params, shared_ptr<PtpClock> clock)
@@ -212,7 +286,16 @@ namespace AirPlay2
         {
             m_queue.pop_front();
         }
-        if (m_stop || IsFlushed(frame.timestamp))
+        if (m_stop)
+        {
+            return;
+        }
+        if (m_params.type == StreamType::Buffered)
+        {
+            m_lastReceivedSeq = frame.seq;
+            m_flush.OnFrame(frame.seq);
+        }
+        if (IsFlushed(frame))
         {
             return;
         }
@@ -234,17 +317,15 @@ namespace AirPlay2
         m_cond.notify_all();
     }
 
-    bool Ap2AudioSession::IsFlushed(uint32_t ts) const noexcept
+    bool Ap2AudioSession::IsFlushed(const AudioFrame& frame) const noexcept
     {
-        if (!m_flushUntil.has_value())
-        {
-            return false;
-        }
-        if (m_flushFrom.has_value() && TsBefore(ts, m_flushFrom.value()))
-        {
-            return false;
-        }
-        return TsBefore(ts, m_flushUntil.value());
+        return m_params.type == StreamType::Buffered && m_flush.IsFlushed(frame.seq);
+    }
+
+    size_t Ap2AudioSession::GetQueuedFrames() const
+    {
+        const lock_guard<mutex> guard(m_mtx);
+        return m_queue.size();
     }
 
     void Ap2AudioSession::RunBufferedReceiver() noexcept
@@ -347,28 +428,58 @@ namespace AirPlay2
             // new anchor while playing (e.g. seeking): resynchronize
             m_restartPending = true;
         }
-        spdlog::debug("AirPlay2: rate {} anchor rtp {} ({})", rate, m_anchorRtp, m_anchorLocalNs.has_value() ? "ptp" : "local timing");
+        spdlog::debug("AirPlay2: rate {} anchor rtp {} ({}), queue {} frames, front seq {} ts {}", rate, m_anchorRtp, m_anchorLocalNs.has_value() ? "ptp" : "local timing",
+            m_queue.size(), m_queue.empty() ? "-"s : to_string(m_queue.front().seq), m_queue.empty() ? "-"s : to_string(m_queue.front().timestamp));
         m_cond.notify_all();
     }
 
-    void Ap2AudioSession::FlushBuffered(optional<uint32_t> fromTimestamp, uint32_t untilTimestamp)
+    void Ap2AudioSession::FlushBuffered(const FlushRequest& request)
     {
         const lock_guard<mutex> guard(m_mtx);
+        const size_t queuedBefore = m_queue.size();
 
-        m_flushFrom = fromTimestamp;
-        m_flushUntil = untilTimestamp;
-
-        const auto isFlushed = [this](const AudioFrame& f) { return IsFlushed(f.timestamp); };
+        if (!request.fromSeq.has_value())
+        {
+            if (request.untilSeq.has_value() && request.untilSeq.value() != 0)
+            {
+                m_flush.Immediate(request.untilSeq.value());
+            }
+            else
+            {
+                // nothing to compare with: drop everything we have
+                m_flush.Clear();
+                m_queue.clear();
+            }
+            // stop the output, wait for a new anchor
+            m_history.clear();
+            m_restartPending = true;
+            m_anchorValid = false;
+        }
+        else if (request.untilSeq.has_value())
+        {
+            m_flush.Deferred(request.fromSeq.value(), request.untilSeq.value());
+        }
+        const auto isFlushed = [this](const AudioFrame& f) { return IsFlushed(f); };
 
         m_queue.erase(remove_if(m_queue.begin(), m_queue.end(), isFlushed), m_queue.end());
         m_history.erase(remove_if(m_history.begin(), m_history.end(), isFlushed), m_history.end());
 
-        if (!fromTimestamp.has_value())
+        // the sender may already have sent the end of the flushed range
+        if (m_lastReceivedSeq.has_value())
         {
-            // immediate flush: stop the output, wait for a new anchor
-            m_restartPending = true;
-            m_anchorValid = false;
+            m_flush.OnFrame(m_lastReceivedSeq.value());
         }
+        spdlog::debug("AirPlay2: {} flush from seq {} ts {} until seq {} ts {}: {} of {} queued frames dropped, last received seq {}, queue front seq {} ts {}",
+            request.fromSeq.has_value() ? "deferred" : "immediate",
+            request.fromSeq.has_value() ? to_string(request.fromSeq.value()) : "-"s,
+            request.fromTimestamp.has_value() ? to_string(request.fromTimestamp.value()) : "-"s,
+            request.untilSeq.has_value() ? to_string(request.untilSeq.value()) : "-"s,
+            request.untilTimestamp,
+            queuedBefore - m_queue.size(), queuedBefore,
+            m_lastReceivedSeq.has_value() ? to_string(m_lastReceivedSeq.value()) : "-"s,
+            m_queue.empty() ? "-"s : to_string(m_queue.front().seq),
+            m_queue.empty() ? "-"s : to_string(m_queue.front().timestamp));
+
         m_condSpace.notify_all();
         m_cond.notify_all();
     }
@@ -602,7 +713,6 @@ namespace AirPlay2
             {
                 if (m_restartPending || (!ShouldPlay() && m_pcm))
                 {
-                    const bool flushed = m_restartPending;
                     m_restartPending = false;
 
                     if (m_pcm)
@@ -616,10 +726,8 @@ namespace AirPlay2
                         m_queue.insert(m_queue.begin(), make_move_iterator(m_history.begin()), make_move_iterator(m_history.end()));
                         m_history.clear();
                     }
-                    if (flushed)
-                    {
-                        continue;
-                    }
+                    // the state may have changed (e.g. a flush) while we weren't holding the lock
+                    continue;
                 }
                 if (!ShouldPlay() || m_queue.empty())
                 {
@@ -634,9 +742,16 @@ namespace AirPlay2
                     if (m_params.type == StreamType::Buffered)
                     {
                         // skip everything before the anchor
+                        size_t skipped = 0;
+
                         while (!m_queue.empty() && TsBefore(m_queue.front().timestamp, m_anchorRtp))
                         {
                             m_queue.pop_front();
+                            ++skipped;
+                        }
+                        if (skipped > 0)
+                        {
+                            spdlog::debug("AirPlay2: skipped {} frames before the anchor rtp {}", skipped, m_anchorRtp);
                         }
                         if (m_queue.empty())
                         {
@@ -661,13 +776,17 @@ namespace AirPlay2
                     {
                         // play the first frame at the time requested by the anchor
                         const int64_t now = LocalTimeNs();
-                        int64_t playAt = m_anchorLocalNs.value() + static_cast<int64_t>(m_queue.front().timestamp - m_anchorRtp) * NsPerSec / samplingRate;
+                        const auto frameTime = [this, samplingRate](const AudioFrame& f)
+                            {
+                                return m_anchorLocalNs.value() + TsDiff(f.timestamp, m_anchorRtp) * NsPerSec / samplingRate;
+                            };
+                        int64_t playAt = frameTime(m_queue.front());
 
                         // drop frames which are already late
                         while (playAt < now && m_queue.size() > 1)
                         {
                             m_queue.pop_front();
-                            playAt = m_anchorLocalNs.value() + static_cast<int64_t>(m_queue.front().timestamp - m_anchorRtp) * NsPerSec / samplingRate;
+                            playAt = frameTime(m_queue.front());
                         }
                         silenceNs = max<int64_t>(playAt - now, 0);
 
@@ -678,6 +797,8 @@ namespace AirPlay2
                             silenceNs = 0;
                         }
                     }
+                    spdlog::debug("AirPlay2: starting output at seq {} ts {} (anchor rtp {}), {} ms silence, {} frames queued",
+                        m_queue.front().seq, m_queue.front().timestamp, m_anchorRtp, silenceNs / 1'000'000, m_queue.size());
                     lock.unlock();
                     StartOutput();
                     WriteSilence(silenceNs);
@@ -701,7 +822,7 @@ namespace AirPlay2
                     m_queue.pop_front();
                     m_condSpace.notify_all();
 
-                    if (IsFlushed(frame.timestamp))
+                    if (IsFlushed(frame))
                     {
                         continue;
                     }
